@@ -3,13 +3,21 @@ xmeye_cloud_to_rtsp.py
 -----------------------
 Logs into a cloud camera (CloudID + user + password, same as VMS's Device
 Manager) via NetSdk.dll, and re-publishes its H264/H265 stream locally over
-HTTP/MPEG-TS for VLC. See README.md for setup, background, and troubleshooting.
+HTTP/MPEG-TS or RTSP for VLC. See README.md for setup, background, and
+troubleshooting.
+
+Supports multiple cameras and multiple streams (main/sub) of the same
+camera running concurrently -- as separate OS processes, one per
+camera+stream, each on its own port. Use --camera to select from CAMERAS in
+_credentials.py, and --port/--path to avoid collisions when running several
+at once (or use run_all.py to launch everything at once automatically).
 """
 
 import argparse
 import ctypes
 import os
 import queue
+import signal
 import sys
 import threading
 import time
@@ -22,9 +30,10 @@ import _credentials as credentials
 # --------------------------------------------------------------------------
 VMS_DIR      = os.path.dirname(os.path.abspath(__file__))
 CHANNEL      = 0
-SUB_STREAM   = 0
-HTTP_PORT    = 8090
-HTTP_PATH    = "live.ts"
+DEFAULT_STREAM = 0          # 0 = main, 1 = sub
+DEFAULT_HTTP_PORT = 8090
+DEFAULT_RTSP_PORT = 8554
+DEFAULT_PATH = "live"
 LOGIN_PORT   = 34567
 
 # --------------------------------------------------------------------------
@@ -100,6 +109,14 @@ ENCODE_H264, ENCODE_H265 = 2, 5
 
 REALDATA_CB = WINFUNCTYPE(c_int, c_long, POINTER(PACKET_INFO_EX), c_long)
 
+# Set once argparse has run, used to prefix every log line so concurrent
+# instances' output stays distinguishable if merged into one place.
+TAG = ""
+
+
+def log(msg):
+    print(f"{TAG}{msg}")
+
 
 def to_annexb(buf: bytes) -> bytes:
     """Defensive: convert AVCC length-prefixed frames to Annex-B if we ever
@@ -144,7 +161,7 @@ def strip_private_markers(buf: bytes) -> bytes:
         else:
             j += 1
     if not starts:
-        return buf  # nothing looks like Annex-B at all; leave untouched
+        return buf
     for idx, (pos, sclen) in enumerate(starts):
         nal_start = pos + sclen
         nal_end = starts[idx + 1][0] if idx + 1 < len(starts) else n
@@ -152,7 +169,7 @@ def strip_private_markers(buf: bytes) -> bytes:
             continue
         forbidden_bit = (buf[nal_start] >> 7) & 1
         if forbidden_bit:
-            continue  # drop this segment (start code + payload) entirely
+            continue
         out += buf[pos:nal_end]
     return bytes(out)
 
@@ -220,22 +237,29 @@ class CloudCamera:
             )
             if login_id:
                 self.login_id = login_id
-                print(f"[+] Logged in. Device serial: {info.sSerialNumber.decode(errors='ignore')}, "
-                      f"channels: {info.byChanNum}")
+                log(f"[+] Logged in. Device serial: {info.sSerialNumber.decode(errors='ignore')}, "
+                    f"channels: {info.byChanNum}")
                 return info
             last_err = err.value
             cloud_err = info.sCloudErrCode.decode(errors="ignore").strip("\x00")
-            print(f"[!] Attempt {attempt}/{retries} failed: error={err.value} "
-                  f"cloudErrCode='{cloud_err}' "
-                  f"(H264_DVR_GetLastError={self.dll.H264_DVR_GetLastError()})")
+            log(f"[!] Attempt {attempt}/{retries} failed: error={err.value} "
+                f"cloudErrCode='{cloud_err}' "
+                f"(H264_DVR_GetLastError={self.dll.H264_DVR_GetLastError()})")
             if skip_p2p and hasattr(self.dll, "H264_DVR_SkipP2P") and attempt == 1:
                 try:
-                    print("[i] Trying experimental H264_DVR_SkipP2P(0, True)...")
+                    log("[i] Trying experimental H264_DVR_SkipP2P(0, True)...")
                     self.dll.H264_DVR_SkipP2P(0, True)
                 except Exception as e:
-                    print(f"[!] SkipP2P call itself raised: {e}")
+                    log(f"[!] SkipP2P call itself raised: {e}")
             time.sleep(retry_delay)
-        raise RuntimeError(f"Cloud login failed after {retries} attempts, last error code {last_err}.")
+        raise RuntimeError(
+            f"Cloud login failed after {retries} attempts, last error code {last_err}. "
+            "If another process/window is already connected to this same CloudID "
+            "(VMS.exe, or another instance of this script on a different stream), "
+            "that can cause a transient device-registration lookup failure -- the "
+            "retries above are meant to ride that out, but if it never resolves, "
+            "try running just one session against this CloudID at a time."
+        )
 
     def start_real_play(self, channel, stream, on_frame):
         client_info = H264_DVR_CLIENTINFO(nChannel=channel, nStream=stream, nMode=0, nComType=0, hWnd=None)
@@ -248,14 +272,14 @@ class CloudCamera:
             try:
                 on_frame(pFrame.contents)
             except Exception as e:
-                print(f"[!] callback error: {e}", file=sys.stderr)
+                print(f"{TAG}[!] callback error: {e}", file=sys.stderr)
             return 0
 
         self._cb_ref = REALDATA_CB(_trampoline)
         ok = self.dll.H264_DVR_SetRealDataCallBack_V2(handle, self._cb_ref, 0)
         if not ok:
             raise RuntimeError("H264_DVR_SetRealDataCallBack_V2 failed")
-        print(f"[+] Real-time stream started (handle={handle})")
+        log(f"[+] Real-time stream started (handle={handle})")
 
     def stop(self):
         if self.real_handle:
@@ -267,45 +291,58 @@ class CloudCamera:
         self.dll.H264_DVR_Cleanup()
 
 
-class FfmpegHttpBridge:
-    """Spawns ffmpeg.exe reading raw H264/H265 from stdin and re-serving it as
-    MPEG-TS over HTTP (ffmpeg acting as its own tiny HTTP server via
-    -listen 1). This is a much older/more universally-supported muxer
-    combination than RTSP-listen-mode-with-HEVC, which repeatedly failed to
-    ever open its listening socket despite input parsing succeeding fine.
-
-    Writes go through a bounded queue drained by a dedicated thread, NOT
-    directly from the caller's thread (the caller is the SDK's own internal
-    callback thread -- a blocking write() here would freeze frame delivery
-    from the camera entirely if ffmpeg's pipe ever backs up)."""
-
-    def __init__(self, ffmpeg_path, port=HTTP_PORT, path=HTTP_PATH, max_queue=500):
+class FfmpegBridge:
+    def __init__(self, ffmpeg_path, protocol="http", port=DEFAULT_HTTP_PORT, path=DEFAULT_PATH,
+                 push_url=None, max_queue=500):
         self.ffmpeg_path = ffmpeg_path
+        self.protocol = protocol
         self.port = port
         self.path = path
+        self.push_url = push_url
         self.proc = None
         self._codec = None
+        self._fps = None
         self._lock = threading.Lock()
         self._q = queue.Queue(maxsize=max_queue)
         self._writer_thread = None
         self._stop = threading.Event()
         self._dropped = 0
 
-    def _spawn(self, codec):
+    def _spawn(self, codec, fps):
         import subprocess
         input_fmt = "h264" if codec == ENCODE_H264 else "hevc"
-        url = f"http://127.0.0.1:{self.port}/{self.path}"
-        cmd = [
-            self.ffmpeg_path, "-loglevel", "verbose",
+        # Raw elementary stream input carries no timing info at all; genpts
+        # alone isn't enough for the mpegts/rtsp muxer to assign valid
+        # per-frame timestamps under -c copy (that flag only backfills PTS
+        # from DTS, and there's no DTS here either). Telling the demuxer the
+        # actual frame rate up front (from the SDK's own dwFrameRate) gives
+        # it a real basis to generate correct, monotonic timestamps from.
+        common = [
+            self.ffmpeg_path, "-loglevel", "warning",
             "-fflags", "+discardcorrupt+genpts",
             "-analyzeduration", "10000000", "-probesize", "5000000",
-            "-f", input_fmt, "-i", "pipe:0",
-            "-c", "copy", "-f", "mpegts", "-listen", "1", url,
+            "-r", str(fps or 15),
+            "-f", input_fmt, "-i", "pipe:0", "-c", "copy",
         ]
-        print("[+] Launching:", " ".join(cmd))
+
+        if self.protocol == "http":
+            url = f"http://127.0.0.1:{self.port}/{self.path}"
+            cmd = common + ["-f", "mpegts", "-listen", "1", url]
+        elif self.protocol == "rtsp":
+            url = f"rtsp://127.0.0.1:{self.port}/{self.path}"
+            cmd = common + ["-f", "rtsp", "-rtsp_flags", "listen", url]
+        else:  # push -- connect out to an already-running RTSP server (e.g. MediaMTX)
+            url = self.push_url
+            cmd = common + ["-f", "rtsp", "-rtsp_transport", "tcp", url]
+
+        log(f"[+] Launching: {' '.join(cmd)}")
         self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
         self._codec = codec
-        print(f"[+] Open this in VLC now:  {url}")
+        self._fps = fps
+        if self.protocol == "push":
+            log(f"[+] Pushing to: {url}  (open that same path on MediaMTX's own port in VLC)")
+        else:
+            log(f"[+] Open this in VLC now: {url}")
 
         def _drain():
             while not self._stop.is_set():
@@ -319,22 +356,30 @@ class FfmpegHttpBridge:
                     if self.proc.stdin:
                         self.proc.stdin.write(data)
                 except (BrokenPipeError, OSError) as e:
-                    print(f"[!] ffmpeg pipe write failed, stream likely dead: {e}")
+                    # Normal when a client (e.g. VLC) disconnects, not
+                    # necessarily a real failure -- with -listen 1, ffmpeg
+                    # exits once its one client goes away. Clear self.proc
+                    # so the next write() respawns a fresh listener instead
+                    # of the stream being permanently dead after the first
+                    # viewer leaves.
+                    log(f"[i] ffmpeg pipe closed ({e}); will restart listener for the next viewer")
+                    with self._lock:
+                        self.proc = None
                     break
 
         self._writer_thread = threading.Thread(target=_drain, daemon=True)
         self._writer_thread.start()
 
-    def write(self, codec, data):
+    def write(self, codec, data, fps=None):
         with self._lock:
             if self.proc is None:
-                self._spawn(codec)
+                self._spawn(codec, fps)
         try:
             self._q.put_nowait(data)
         except queue.Full:
             self._dropped += 1
             if self._dropped % 50 == 1:
-                print(f"[!] ffmpeg falling behind, dropped {self._dropped} frames so far")
+                log(f"[!] ffmpeg falling behind, dropped {self._dropped} frames so far")
 
     def close(self):
         self._stop.set()
@@ -349,27 +394,58 @@ class FfmpegHttpBridge:
             self.proc.terminate()
 
 
+def resolve_credentials(camera_name):
+    """Supports two _credentials.py shapes:
+      - single-camera (backwards compatible): CLOUD_ID / DEVICE_USER / DEVICE_PASS
+      - multi-camera: CAMERAS = {"name": {"cloud_id":..,"user":..,"password":..}, ...}
+    --camera selects from CAMERAS; omit it to use the flat single-camera vars."""
+    if camera_name:
+        cams = getattr(credentials, "CAMERAS", None)
+        if not cams or camera_name not in cams:
+            available = ", ".join(cams.keys()) if cams else "(none defined)"
+            sys.exit(f"--camera '{camera_name}' not found in _credentials.py CAMERAS. "
+                      f"Available: {available}")
+        c = cams[camera_name]
+        return c["cloud_id"], c["user"], c["password"]
+    return credentials.CLOUD_ID, credentials.DEVICE_USER, credentials.DEVICE_PASS
+
+
 def main():
+    global TAG
     import subprocess
-    try:
-        v = subprocess.run([os.path.join(VMS_DIR, "ffmpeg.exe"), "-version"],
-                            capture_output=True, text=True, timeout=5)
-        print("[i]", v.stdout.splitlines()[0] if v.stdout else "(no version output)")
-    except Exception as e:
-        print(f"[!] Could not check ffmpeg -version: {e}")
 
     ap = argparse.ArgumentParser()
     ap.add_argument("--vms-dir", default=VMS_DIR)
-    ap.add_argument("--cloud-id", default=credentials.CLOUD_ID)
-    ap.add_argument("--user", default=credentials.DEVICE_USER)
-    ap.add_argument("--password", default=credentials.DEVICE_PASS)
+    ap.add_argument("--camera", default=None,
+                     help="Name of an entry in _credentials.py's CAMERAS dict. "
+                          "Omit to use the flat CLOUD_ID/DEVICE_USER/DEVICE_PASS vars.")
+    ap.add_argument("--cloud-id", default=None, help="Overrides whatever --camera/defaults resolve to")
+    ap.add_argument("--user", default=None)
+    ap.add_argument("--password", default=None)
     ap.add_argument("--channel", type=int, default=CHANNEL)
-    ap.add_argument("--stream", type=int, default=SUB_STREAM, help="0=main, 1=sub")
+    ap.add_argument("--stream", type=int, default=DEFAULT_STREAM, help="0=main, 1=sub")
+    ap.add_argument("--protocol", choices=["http", "rtsp", "push"], default="http",
+                     help="http/rtsp: this script listens itself (single stream, own port). "
+                          "push: connect out to an already-running RTSP server (e.g. MediaMTX) "
+                          "instead -- needed to put multiple streams on one shared port, or for "
+                          "on-demand start/stop. See README.")
+    ap.add_argument("--push-url", default=None,
+                     help="Target URL for --protocol push. Defaults to "
+                          "rtsp://127.0.0.1:8554/<camera>_<stream> if omitted.")
+    ap.add_argument("--port", type=int, default=None,
+                     help="Local port to serve on. Required to differ across concurrent "
+                          "instances. Defaults to 8090 (http) / 8554 (rtsp) if omitted -- "
+                          "fine for a single instance, but set explicitly when running "
+                          "more than one at once.")
+    ap.add_argument("--path", default=DEFAULT_PATH)
     ap.add_argument("--probe", metavar="FILE")
     ap.add_argument("--probe-seconds", type=float, default=5.0)
     ap.add_argument("--skip-p2p", action="store_true")
     ap.add_argument("--convert", nargs=2, metavar=("IN", "OUT"))
     args = ap.parse_args()
+
+    stream_label = "main" if args.stream == 0 else f"stream{args.stream}"
+    TAG = f"[{args.camera or 'default'}/{stream_label}] "
 
     if args.convert:
         src, dst = args.convert
@@ -377,12 +453,24 @@ def main():
             data = f.read()
         with open(dst, "wb") as f:
             f.write(strip_private_markers(to_annexb(data)))
-        print(f"[+] Converted {src} -> {dst} ({len(data)} -> {os.path.getsize(dst)} bytes)")
+        log(f"[+] Converted {src} -> {dst} ({len(data)} -> {os.path.getsize(dst)} bytes)")
         return
+
+    cloud_id, user, password = resolve_credentials(args.camera)
+    cloud_id = args.cloud_id or cloud_id
+    user = args.user or user
+    password = args.password or password
+
+    try:
+        v = subprocess.run([os.path.join(args.vms_dir, "ffmpeg.exe"), "-version"],
+                            capture_output=True, text=True, timeout=5)
+        log("[i] " + (v.stdout.splitlines()[0] if v.stdout else "(no version output)"))
+    except Exception as e:
+        log(f"[!] Could not check ffmpeg -version: {e}")
 
     cam = CloudCamera(args.vms_dir)
     cam.init()
-    cam.login(args.cloud_id, args.user, args.password, skip_p2p=args.skip_p2p)
+    cam.login(cloud_id, user, password, skip_p2p=args.skip_p2p)
 
     stats = {"frames": 0, "bytes": 0, "start": time.time()}
 
@@ -395,8 +483,8 @@ def main():
                 if stats["frames"] == 0:
                     codec_name = {ENCODE_H264: "H264", ENCODE_H265: "H265"}.get(
                         frame.nEncodeType, f"unknown({frame.nEncodeType})")
-                    print(f"[i] First frame: nEncodeType={frame.nEncodeType} ({codec_name}), "
-                          f"{frame.uWidth}x{frame.uHeight}")
+                    log(f"[i] First frame: nEncodeType={frame.nEncodeType} ({codec_name}), "
+                        f"{frame.uWidth}x{frame.uHeight}")
                 buf = strip_private_markers(to_annexb(string_at(frame.pPacketBuffer, frame.dwPacketSize)))
                 f.write(buf)
                 stats["frames"] += 1
@@ -406,34 +494,53 @@ def main():
         while time.time() < deadline:
             time.sleep(0.2)
         f.close()
-        print(f"[+] Wrote {stats['bytes']} bytes / {stats['frames']} frames to {args.probe}")
+        log(f"[+] Wrote {stats['bytes']} bytes / {stats['frames']} frames to {args.probe}")
         cam.stop()
         return
 
-    bridge = FfmpegHttpBridge(os.path.join(args.vms_dir, "ffmpeg.exe"))
+    port = args.port or (DEFAULT_RTSP_PORT if args.protocol == "rtsp" else DEFAULT_HTTP_PORT)
+    push_url = args.push_url or f"rtsp://127.0.0.1:{DEFAULT_RTSP_PORT}/{args.camera or 'cam'}_{stream_label}"
+    bridge = FfmpegBridge(os.path.join(args.vms_dir, "ffmpeg.exe"),
+                          protocol=args.protocol, port=port, path=args.path, push_url=push_url)
 
     def on_frame(frame):
         if frame.nPacketType in VIDEO_PACKET_TYPES and frame.dwPacketSize:
             buf = strip_private_markers(to_annexb(string_at(frame.pPacketBuffer, frame.dwPacketSize)))
-            bridge.write(frame.nEncodeType, buf)
+            bridge.write(frame.nEncodeType, buf, fps=frame.dwFrameRate)
             stats["frames"] += 1
             stats["bytes"] += len(buf)
 
     cam.start_real_play(args.channel, args.stream, on_frame)
 
-    print("[i] Streaming... Ctrl+C to stop.")
+    # Graceful shutdown: if this process is running under MediaMTX's
+    # runOnDemand (protocol=push), MediaMTX stops it with a normal process
+    # termination once the last viewer disconnects, not Ctrl+C -- catch
+    # that too so the camera gets logged out cleanly rather than left in a
+    # half-open session. (Best-effort on Windows: a forceful kill can still
+    # bypass this, same as it would for any process.)
+    stop_requested = threading.Event()
+
+    def _handle_term(signum, frame):
+        stop_requested.set()
+
     try:
-        while True:
+        signal.signal(signal.SIGTERM, _handle_term)
+    except (ValueError, AttributeError):
+        pass  # not available in this environment; Ctrl+C still works below
+
+    log("[i] Streaming... Ctrl+C to stop.")
+    try:
+        while not stop_requested.is_set():
             time.sleep(5)
             elapsed = time.time() - stats["start"]
-            print(f"[i] {stats['frames']} frames, {stats['bytes']/1024:.0f} KB, "
-                  f"{stats['frames']/max(elapsed,1):.1f} fps avg")
+            log(f"[i] {stats['frames']} frames, {stats['bytes']/1024:.0f} KB, "
+                f"{stats['frames']/max(elapsed,1):.1f} fps avg")
     except KeyboardInterrupt:
         pass
     finally:
         bridge.close()
         cam.stop()
-        print("[+] Stopped cleanly.")
+        log("[+] Stopped cleanly.")
 
 
 if __name__ == "__main__":
