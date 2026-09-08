@@ -352,28 +352,37 @@ class FfmpegBridge:
                     continue
                 if data is None:
                     break
+                with self._lock:
+                    proc = self.proc
+                    if proc is None or proc.poll() is not None:
+                        if proc is not None:
+                            log(f"[!] ffmpeg exited (code {proc.returncode}); restarting")
+                            self.proc = None
+                        continue
                 try:
-                    if self.proc.stdin:
-                        self.proc.stdin.write(data)
+                    if proc.stdin:
+                        proc.stdin.write(data)
                 except (BrokenPipeError, OSError) as e:
-                    # Normal when a client (e.g. VLC) disconnects, not
-                    # necessarily a real failure -- with -listen 1, ffmpeg
-                    # exits once its one client goes away. Clear self.proc
-                    # so the next write() respawns a fresh listener instead
-                    # of the stream being permanently dead after the first
-                    # viewer leaves.
                     log(f"[i] ffmpeg pipe closed ({e}); will restart listener for the next viewer")
                     with self._lock:
-                        self.proc = None
-                    break
+                        if self.proc is proc:
+                            self.proc = None
 
-        self._writer_thread = threading.Thread(target=_drain, daemon=True)
-        self._writer_thread.start()
+        if self._writer_thread is None or not self._writer_thread.is_alive():
+            self._writer_thread = threading.Thread(target=_drain, daemon=True)
+            self._writer_thread.start()
 
     def write(self, codec, data, fps=None):
         with self._lock:
-            if self.proc is None:
-                self._spawn(codec, fps)
+            if self.proc is None or self.proc.poll() is not None:
+                if self.proc is not None:
+                    log(f"[!] ffmpeg exited (code {self.proc.returncode}); restarting")
+                    self.proc = None
+                try:
+                    self._spawn(codec, fps)
+                except OSError as e:
+                    log(f"[!] Could not start ffmpeg: {e}")
+                    return
         try:
             self._q.put_nowait(data)
         except queue.Full:
@@ -384,14 +393,25 @@ class FfmpegBridge:
     def close(self):
         self._stop.set()
         if self._writer_thread:
-            self._q.put(None)
+            try:
+                self._q.put_nowait(None)
+            except queue.Full:
+                pass
             self._writer_thread.join(timeout=2)
         if self.proc:
             try:
                 self.proc.stdin.close()
             except Exception:
                 pass
-            self.proc.terminate()
+            try:
+                self.proc.terminate()
+                self.proc.wait(timeout=2)
+            except Exception:
+                try:
+                    self.proc.kill()
+                except Exception:
+                    pass
+            self.proc = None
 
 
 def resolve_credentials(camera_name):
