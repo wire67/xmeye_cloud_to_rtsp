@@ -305,8 +305,11 @@ class FfmpegBridge:
         self._lock = threading.Lock()
         self._q = queue.Queue(maxsize=max_queue)
         self._writer_thread = None
+        self._monitor_thread = None
         self._stop = threading.Event()
         self._dropped = 0
+        self._last_input_at = 0
+        self._last_write_at = time.monotonic()
 
     def _spawn(self, codec, fps):
         import subprocess
@@ -337,6 +340,7 @@ class FfmpegBridge:
 
         log(f"[+] Launching: {' '.join(cmd)}")
         self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+        self._last_write_at = time.monotonic()
         self._codec = codec
         self._fps = fps
         if self.protocol == "push":
@@ -362,6 +366,8 @@ class FfmpegBridge:
                 try:
                     if proc.stdin:
                         proc.stdin.write(data)
+                        proc.stdin.flush()
+                        self._last_write_at = time.monotonic()
                 except (BrokenPipeError, OSError) as e:
                     log(f"[i] ffmpeg pipe closed ({e}); will restart listener for the next viewer")
                     with self._lock:
@@ -372,7 +378,36 @@ class FfmpegBridge:
             self._writer_thread = threading.Thread(target=_drain, daemon=True)
             self._writer_thread.start()
 
+        def _monitor():
+            while not self._stop.wait(5):
+                with self._lock:
+                    proc = self.proc
+                    last_input_at = self._last_input_at
+                    last_write_at = self._last_write_at
+                if proc is None:
+                    continue
+                if proc.poll() is not None:
+                    log(f"[!] ffmpeg exited (code {proc.returncode}); restarting on next frame")
+                    with self._lock:
+                        if self.proc is proc:
+                            self.proc = None
+                    continue
+                if last_input_at > last_write_at and time.monotonic() - last_write_at >= 15:
+                    log("[!] ffmpeg server stopped accepting stream data; restarting it")
+                    try:
+                        proc.terminate()
+                    except OSError:
+                        pass
+                    with self._lock:
+                        if self.proc is proc:
+                            self.proc = None
+
+        if self._monitor_thread is None or not self._monitor_thread.is_alive():
+            self._monitor_thread = threading.Thread(target=_monitor, daemon=True)
+            self._monitor_thread.start()
+
     def write(self, codec, data, fps=None):
+        self._last_input_at = time.monotonic()
         with self._lock:
             if self.proc is None or self.proc.poll() is not None:
                 if self.proc is not None:
@@ -552,9 +587,6 @@ def main():
     try:
         while not stop_requested.is_set():
             time.sleep(5)
-            elapsed = time.time() - stats["start"]
-            log(f"[i] {stats['frames']} frames, {stats['bytes']/1024:.0f} KB, "
-                f"{stats['frames']/max(elapsed,1):.1f} fps avg")
     except KeyboardInterrupt:
         pass
     finally:
