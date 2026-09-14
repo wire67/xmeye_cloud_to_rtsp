@@ -25,6 +25,7 @@ from ctypes import (
     Structure, POINTER, WINFUNCTYPE, c_int, c_uint, c_long, c_ulong,
     c_ushort, c_char, c_char_p, c_void_p, c_bool, byref, string_at,
 )
+from datetime import datetime
 import _credentials as credentials
 
 # --------------------------------------------------------------------------
@@ -115,7 +116,8 @@ TAG = ""
 
 
 def log(msg):
-    print(f"{TAG}{msg}")
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+    print(f"[{timestamp}] {TAG}{msg}", flush=True)
 
 
 def to_annexb(buf: bytes) -> bytes:
@@ -272,7 +274,7 @@ class CloudCamera:
             try:
                 on_frame(pFrame.contents)
             except Exception as e:
-                print(f"{TAG}[!] callback error: {e}", file=sys.stderr)
+                log(f"[!] callback error: {e}")
             return 0
 
         self._cb_ref = REALDATA_CB(_trampoline)
@@ -339,7 +341,10 @@ class FfmpegBridge:
             cmd = common + ["-f", "rtsp", "-rtsp_transport", "tcp", url]
 
         log(f"[+] Launching: {' '.join(cmd)}")
-        self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+        self.proc = subprocess.Popen(
+            cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=False, bufsize=0,
+        )
         self._last_write_at = time.monotonic()
         self._codec = codec
         self._fps = fps
@@ -347,6 +352,14 @@ class FfmpegBridge:
             log(f"[+] Pushing to: {url}  (open that same path on MediaMTX's own port in VLC)")
         else:
             log(f"[+] Open this in VLC now: {url}")
+
+        def _read_stderr(proc):
+            for raw_line in proc.stderr:
+                line = raw_line.decode(errors="replace").rstrip()
+                if line:
+                    log(f"[ffmpeg] {line}")
+
+        threading.Thread(target=_read_stderr, args=(self.proc,), daemon=True).start()
 
         def _drain():
             while not self._stop.is_set():
@@ -396,6 +409,11 @@ class FfmpegBridge:
                     log("[!] ffmpeg server stopped accepting stream data; restarting it")
                     try:
                         proc.terminate()
+                        proc.wait(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        log("[!] ffmpeg did not terminate; killing it")
+                        proc.kill()
+                        proc.wait()
                     except OSError:
                         pass
                     with self._lock:
@@ -557,15 +575,21 @@ def main():
     push_url = args.push_url or f"rtsp://127.0.0.1:{DEFAULT_RTSP_PORT}/{args.camera or 'cam'}_{stream_label}"
     bridge = FfmpegBridge(os.path.join(args.vms_dir, "ffmpeg.exe"),
                           protocol=args.protocol, port=port, path=args.path, push_url=push_url)
+    last_frame_at = time.monotonic()
 
     def on_frame(frame):
+        nonlocal last_frame_at
         if frame.nPacketType in VIDEO_PACKET_TYPES and frame.dwPacketSize:
             buf = strip_private_markers(to_annexb(string_at(frame.pPacketBuffer, frame.dwPacketSize)))
             bridge.write(frame.nEncodeType, buf, fps=frame.dwFrameRate)
             stats["frames"] += 1
             stats["bytes"] += len(buf)
+            last_frame_at = time.monotonic()
 
-    cam.start_real_play(args.channel, args.stream, on_frame)
+    def start_camera_stream():
+        cam.start_real_play(args.channel, args.stream, on_frame)
+
+    start_camera_stream()
 
     # Graceful shutdown: if this process is running under MediaMTX's
     # runOnDemand (protocol=push), MediaMTX stops it with a normal process
@@ -586,7 +610,23 @@ def main():
     log("[i] Streaming... Ctrl+C to stop.")
     try:
         while not stop_requested.is_set():
-            time.sleep(5)
+            time.sleep(20)
+            silence_for = time.monotonic() - last_frame_at
+            if silence_for >= 60:
+                log(f"[!] No video frames received for {silence_for:.0f}s; reconnecting camera session")
+                last_frame_at = time.monotonic()
+                try:
+                    bridge.close()
+                    bridge = FfmpegBridge(os.path.join(args.vms_dir, "ffmpeg.exe"),
+                                          protocol=args.protocol, port=port,
+                                          path=args.path, push_url=push_url)
+                    cam.stop()
+                    cam.init()
+                    cam.login(cloud_id, user, password, skip_p2p=args.skip_p2p)
+                    start_camera_stream()
+                    log("[+] Camera session reconnected; waiting for video frames")
+                except Exception as e:
+                    log(f"[!] Camera session reconnect failed: {e}; retrying in 20s")
     except KeyboardInterrupt:
         pass
     finally:

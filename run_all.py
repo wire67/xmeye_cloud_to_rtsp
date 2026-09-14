@@ -22,6 +22,7 @@ Ctrl+C stops every child process cleanly.
 """
 
 import argparse
+from datetime import datetime
 import os
 import subprocess
 import sys
@@ -30,6 +31,11 @@ import time
 import _credentials as credentials
 
 SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "xmeye_cloud_to_rtsp.py")
+
+
+def log(msg):
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+    print(f"[{timestamp}] {msg}", flush=True)
 
 
 def main():
@@ -68,27 +74,27 @@ def main():
                 "--port", str(port),
                 "--path", path,
             ]
-            print(f"[launcher] starting {name} stream={stream} on port {port}: {' '.join(cmd)}")
+            log(f"[launcher] starting {name} stream={stream} on port {port}: {' '.join(cmd)}")
             p = subprocess.Popen(cmd)
             procs.append(p)
             summary.append((name, stream, f"{url_scheme}://127.0.0.1:{port}/{path}"))
             port += 1
             time.sleep(1)  # stagger startups a bit rather than hammering everything at once
 
-    print("\n[launcher] All started. VLC URLs (may take ~15-30s each to come up):")
+    log("[launcher] All started. VLC URLs (may take ~15-30s each to come up):")
     for name, stream, url in summary:
         label = "main" if stream == 0 else f"stream{stream}"
-        print(f"  {name:12s} {label:8s} {url}")
-    print("\n[launcher] Ctrl+C to stop everything.\n")
+        log(f"  {name:12s} {label:8s} {url}")
+    log("[launcher] Ctrl+C to stop everything.")
 
     try:
         while True:
             time.sleep(2)
             for p in procs:
                 if p.poll() is not None:
-                    print(f"[launcher] warning: a child process exited (code {p.returncode})")
+                    log(f"[launcher] warning: a child process exited (code {p.returncode})")
     except KeyboardInterrupt:
-        print("\n[launcher] Stopping all child processes...")
+        log("[launcher] Stopping all child processes...")
         for p in procs:
             p.terminate()
         for p in procs:
@@ -96,7 +102,7 @@ def main():
                 p.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 p.kill()
-        print("[launcher] Done.")
+        log("[launcher] Done.")
 
 
 if __name__ == "__main__":
